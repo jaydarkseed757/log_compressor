@@ -1,0 +1,626 @@
+#!/usr/bin/env bash
+# =============================================================================
+# compress_logs.sh — compress uncompressed log files, matching each log
+#                     family's existing compression convention
+# Author  : (your name here)
+# Requires: bash 4.2+, find, coreutils (stat), and the compressors you use.
+#           Uses parallel compressors automatically when present:
+#             gzip  -> pigz    (falls back to gzip)
+#             bzip2 -> lbzip2  (falls back to bzip2)
+#             xz    -> xz -T   (native multithreading, >= 5.2)
+#
+# Behavior:
+#   Log files are grouped into "families" by stripping the rotation number
+#   and any compression extension from the name. For example, these all
+#   belong to the family "messages":
+#       messages          (active log)
+#       messages.1        (rotated, uncompressed)
+#       messages.2        (rotated, uncompressed)
+#       messages.3.gz     (rotated, already gzip)
+#
+#   A family's already-compressed members decide which compressor is used for
+#   its uncompressed members, so a gzip family stays gzip and a bzip2 family
+#   stays bzip2. Families with no compressed members use the default (-c).
+#
+#   A full report is printed at the end of every run.
+#
+# Skipped automatically:
+#   - Files that are already compressed (.gz .bz2 .xz .zst .lz4 .lzo .Z .zip .zz)
+#   - Empty files
+#   - Files currently open by another process (one batched lsof call)
+#   - The active (rotation-less, uncompressed) member of a family that has
+#     other members — the live log. Override with --include-active.
+#   - Families whose convention is a format this host can't produce.
+#
+# Usage: compress_logs.sh [OPTIONS]
+#
+# Exit codes:
+#   0  All eligible files compressed successfully
+#   1  One or more files failed to compress
+#   3  Script / dependency / argument error
+# =============================================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# ---------------------------------------------------------------------------
+# Constants & defaults
+# ---------------------------------------------------------------------------
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+readonly SEP=$'\x1f'   # field separator for report records (not valid in paths)
+
+LOG_DIR="/var/log"
+DEFAULT_COMPRESSOR="bzip2"
+THREADS=0
+DRY_RUN=0
+VERBOSE=0
+RECURSE=0
+INCLUDE_ACTIVE=0
+
+readonly -a COMPRESSED_EXTENSIONS=(gz bz2 xz zst lz4 lzo Z zip zz)
+
+# ---------------------------------------------------------------------------
+# Runtime report state
+# ---------------------------------------------------------------------------
+declare -a RPT_COMPRESSED=()       # file SEP tool SEP orig SEP comp  (comp=-1 dry-run)
+declare -a RPT_FAILED=()           # file
+declare -A RPT_SKIP_REASONS=()     # reason -> count
+declare -a RPT_SKIP_FILES=()       # file SEP reason  (for -v listing)
+declare -A RPT_FAM_DONE=()         # family key -> count compressed this run
+TOTAL_ORIG=0
+TOTAL_COMP=0
+RUN_START_EPOCH=0
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+log_info()    { printf "[INFO]  %s\n" "$*"; }
+log_ok()      { printf "[OK]    %s\n" "$*"; }
+log_warn()    { printf "[WARN]  %s\n" "$*" >&2; }
+log_error()   { printf "[ERROR] %s\n" "$*" >&2; }
+log_verbose() { if [[ "$VERBOSE" -eq 1 ]]; then printf "[DEBUG] %s\n" "$*"; fi; }
+die()         { log_error "$@"; exit 3; }
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+
+${SCRIPT_NAME} — compress uncompressed log files, matching each family's convention
+
+Usage:
+  $SCRIPT_NAME [OPTIONS]
+
+Options:
+  -d DIR            Directory to process          (default: ${LOG_DIR})
+  -c COMPRESSOR     Default compressor for families with no compressed
+                    members yet: bzip2 | gzip | xz (default: ${DEFAULT_COMPRESSOR})
+  -T, --threads N   Threads for parallel compressors, 0 = auto/all cores
+                    (default: ${THREADS})
+  -r                Recurse into subdirectories
+  --include-active  Also compress active (rotation-less) logs that have siblings
+  -n, --dry-run     Show what would happen without compressing anything
+  -v                Verbose output (per-file detail in the final report)
+  -h, --help        Show this help and exit
+
+Parallel compressors (used automatically when installed):
+  gzip  -> pigz       bzip2 -> lbzip2       xz -> xz -T
+
+Examples:
+  $SCRIPT_NAME -r                 # /var/log recursively
+  $SCRIPT_NAME -r -n -v           # preview, full per-file report
+  $SCRIPT_NAME -c gzip -T 4 -r    # new families default to gzip, 4 threads
+
+Exit codes:
+  0  All eligible files compressed successfully
+  1  One or more files failed to compress
+  3  Script / argument / dependency error
+
+EOF
+    exit 3
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d)               LOG_DIR="$2";            shift 2 ;;
+            -c)               DEFAULT_COMPRESSOR="$2"; shift 2 ;;
+            -T|--threads)     THREADS="$2";            shift 2 ;;
+            -r)               RECURSE=1;               shift   ;;
+            --include-active) INCLUDE_ACTIVE=1;        shift   ;;
+            -n|--dry-run)     DRY_RUN=1;               shift   ;;
+            -v)               VERBOSE=1;               shift   ;;
+            -h|--help)        usage ;;
+            *) log_error "Unknown option: $1"; usage ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+validate_args() {
+    [[ "$LOG_DIR" == *..* ]] && die "Path traversal detected in -d argument."
+
+    [[ -e "$LOG_DIR" ]] || die "Directory not found: ${LOG_DIR}"
+    [[ -d "$LOG_DIR" ]] || die "Not a directory: ${LOG_DIR}"
+    [[ -r "$LOG_DIR" ]] || die "Directory not readable: ${LOG_DIR}"
+    [[ -x "$LOG_DIR" ]] || die "Directory not executable (cannot list): ${LOG_DIR}"
+
+    case "$DEFAULT_COMPRESSOR" in
+        bzip2|gzip|xz) ;;
+        *) die "-c must be one of: bzip2, gzip, xz (got: ${DEFAULT_COMPRESSOR})" ;;
+    esac
+
+    [[ "$THREADS" =~ ^[0-9]+$ ]] || die "-T/--threads must be a non-negative integer (got: ${THREADS})"
+}
+
+# ---------------------------------------------------------------------------
+# Extension <-> compressor mapping
+# ---------------------------------------------------------------------------
+ext_for_compressor() {
+    case "$1" in
+        gzip)  printf 'gz'  ;;
+        bzip2) printf 'bz2' ;;
+        xz)    printf 'xz'  ;;
+        *)     printf ''    ;;
+    esac
+}
+
+# Human label for a compression extension
+ext_label() {
+    case "$1" in
+        gz)  printf 'gzip'  ;;
+        bz2) printf 'bzip2' ;;
+        xz)  printf 'xz'    ;;
+        *)   printf '%s' "$1" ;;
+    esac
+}
+
+declare -a RESOLVED_CMD
+resolve_compressor() {
+    local ext="$1"
+    RESOLVED_CMD=()
+    case "$ext" in
+        gz)
+            if   command -v pigz &>/dev/null; then
+                RESOLVED_CMD=(pigz -9)
+                [[ "$THREADS" -ne 0 ]] && RESOLVED_CMD+=(-p "$THREADS")
+            elif command -v gzip &>/dev/null; then
+                RESOLVED_CMD=(gzip -9)
+            fi
+            ;;
+        bz2)
+            if   command -v lbzip2 &>/dev/null; then
+                RESOLVED_CMD=(lbzip2 -9)
+                [[ "$THREADS" -ne 0 ]] && RESOLVED_CMD+=(-n "$THREADS")
+            elif command -v bzip2 &>/dev/null; then
+                RESOLVED_CMD=(bzip2 -9)
+            fi
+            ;;
+        xz)
+            if command -v xz &>/dev/null; then
+                if [[ "$THREADS" -eq 0 ]]; then
+                    RESOLVED_CMD=(xz -9 -T0)
+                else
+                    RESOLVED_CMD=(xz -9 -T "$THREADS")
+                fi
+            fi
+            ;;
+    esac
+    return 0
+}
+
+can_produce() {
+    resolve_compressor "$1"
+    [[ "${#RESOLVED_CMD[@]}" -gt 0 ]]
+}
+
+# ---------------------------------------------------------------------------
+# Dependency check
+# ---------------------------------------------------------------------------
+HAVE_LSOF=0
+check_deps() {
+    command -v find &>/dev/null || die "Required tool not found: find"
+    command -v stat &>/dev/null || die "Required tool not found: stat"
+
+    local default_ext
+    default_ext="$(ext_for_compressor "$DEFAULT_COMPRESSOR")"
+    can_produce "$default_ext" \
+        || die "Cannot produce .${default_ext} — no tool for default compressor ${DEFAULT_COMPRESSOR}."
+
+    if command -v lsof &>/dev/null; then
+        HAVE_LSOF=1
+    else
+        log_warn "lsof not found — open-file check will be skipped."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+is_compressed_ext() {
+    local ext="$1" e
+    for e in "${COMPRESSED_EXTENSIONS[@]}"; do
+        [[ "$ext" == "$e" ]] && return 0
+    done
+    return 1
+}
+
+PARSED_KEY=""; PARSED_ROT=""; PARSED_COMP=""
+parse_logname() {
+    local name="$1"
+    PARSED_COMP=""; PARSED_ROT=""
+    if [[ "$name" == *.* ]]; then
+        local ext="${name##*.}"
+        if is_compressed_ext "$ext"; then PARSED_COMP="$ext"; name="${name%.*}"; fi
+    fi
+    if [[ "$name" == *.* ]]; then
+        local maybe="${name##*.}"
+        if [[ "$maybe" =~ ^[0-9]+$ ]]; then PARSED_ROT="$maybe"; name="${name%.*}"; fi
+    fi
+    PARSED_KEY="$name"
+}
+
+# human_bytes <int>  — pure-bash, no fork, one decimal place
+human_bytes() {
+    local bytes="$1"
+    local -a units=(B KiB MiB GiB TiB PiB)
+    local i=0 scaled="$bytes"
+    while (( scaled >= 1024 && i < ${#units[@]} - 1 )); do
+        scaled=$(( scaled / 1024 )); i=$(( i + 1 ))
+    done
+    if (( i == 0 )); then printf '%d B' "$bytes"; return; fi
+    local divisor=1 k=0
+    while (( k < i )); do divisor=$(( divisor * 1024 )); k=$(( k + 1 )); done
+    local tenths=$(( bytes * 10 / divisor ))
+    printf '%d.%d %s' $(( tenths / 10 )) $(( tenths % 10 )) "${units[i]}"
+}
+
+# pct_saved <orig> <comp>  — integer percent of space saved
+pct_saved() {
+    local orig="$1" comp="$2"
+    (( orig <= 0 )) && { printf '0'; return; }
+    printf '%d' $(( (orig - comp) * 100 / orig ))
+}
+
+# trunc <string> <maxlen>  — left-truncate with leading ellipsis
+trunc() {
+    local s="$1" n="$2"
+    if (( ${#s} > n )); then
+        local off=$(( n - 1 ))
+        printf '…%s' "${s: -off}"
+    else
+        printf '%s' "$s"
+    fi
+}
+
+record_skip() {
+    local file="$1" reason="$2"
+    RPT_SKIP_REASONS["$reason"]=$(( ${RPT_SKIP_REASONS["$reason"]:-0} + 1 ))
+    RPT_SKIP_FILES+=("${file}${SEP}${reason}")
+}
+
+# ---------------------------------------------------------------------------
+# do_compress <filepath> <ext>
+# In-place compression preserves mode/owner/mtime. Records report data.
+# Returns 0 ok, 1 fail.
+# ---------------------------------------------------------------------------
+do_compress() {
+    local filepath="$1" ext="$2"
+    local target="${filepath}.${ext}"
+
+    resolve_compressor "$ext"
+    local tool="${RESOLVED_CMD[0]}"
+
+    local orig=0
+    orig=$(stat -c '%s' "$filepath" 2>/dev/null || echo 0)
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        RPT_COMPRESSED+=("${filepath}${SEP}${tool}${SEP}${orig}${SEP}-1")
+        TOTAL_ORIG=$(( TOTAL_ORIG + orig ))
+        if [[ "$VERBOSE" -eq 1 ]]; then
+            local cmd_str
+            cmd_str="$(IFS=' '; printf '%s' "${RESOLVED_CMD[*]}")"
+            log_info "[DRY-RUN] ${cmd_str} -- ${filepath}   (→ ${target})"
+        else
+            log_info "[DRY-RUN] Would compress with ${tool}: ${filepath} → ${target}"
+        fi
+        return 0
+    fi
+
+    if "${RESOLVED_CMD[@]}" -- "$filepath" 2>/dev/null; then
+        [[ -e "$filepath" && -e "$target" ]] && rm -f "$filepath"
+        local comp=0
+        comp=$(stat -c '%s' "$target" 2>/dev/null || echo 0)
+        RPT_COMPRESSED+=("${filepath}${SEP}${tool}${SEP}${orig}${SEP}${comp}")
+        TOTAL_ORIG=$(( TOTAL_ORIG + orig ))
+        TOTAL_COMP=$(( TOTAL_COMP + comp ))
+        log_ok "Compressed (${tool}): ${filepath} → ${target}"
+        return 0
+    else
+        RPT_FAILED+=("$filepath")
+        log_error "Failed to compress: ${filepath}"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Final report
+# ---------------------------------------------------------------------------
+print_report() {
+    local default_ext="$1"
+
+    local now_epoch elapsed
+    now_epoch=$(date +%s)
+    elapsed=$(( now_epoch - RUN_START_EPOCH ))
+
+    local host
+    host=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "unknown")
+
+    local rule
+    rule="$(printf '═%.0s' {1..72})"
+    local thin
+    thin="$(printf '─%.0s' {1..72})"
+
+    printf '\n%s\n' "$rule"
+    printf '  COMPRESSION REPORT%s\n' "$( [[ $DRY_RUN -eq 1 ]] && echo '  (DRY RUN — nothing was changed)' )"
+    printf '%s\n' "$rule"
+    printf '  %-13s %s\n' "Host"        "$host"
+    printf '  %-13s %s\n' "Directory"   "$LOG_DIR"
+    printf '  %-13s %s\n' "Recurse"     "$( [[ $RECURSE -eq 1 ]] && echo yes || echo no )"
+    printf '  %-13s %s\n' "Default"     "${DEFAULT_COMPRESSOR} (.${default_ext})"
+    printf '  %-13s %s\n' "Threads"     "$( [[ $THREADS -eq 0 ]] && echo 'auto (all cores)' || echo "$THREADS" )"
+    printf '  %-13s %ss\n' "Elapsed"    "$elapsed"
+
+    # --- Families -----------------------------------------------------------
+    printf '\n%s\n' "$thin"
+    printf '  FAMILIES\n'
+    printf '%s\n' "$thin"
+    printf '  %-34s %-16s %7s %10s\n' "Family" "Convention" "Members" "Done"
+
+    local -a fam_keys=()
+    local k
+    while IFS= read -r -d '' k; do fam_keys+=("$k"); done < <(
+        for k in "${!FAMILY_COUNT[@]}"; do printf '%s\0' "$k"; done | sort -z
+    )
+
+    for k in "${fam_keys[@]}"; do
+        local members="${FAMILY_COUNT[$k]}"
+        local done_n="${RPT_FAM_DONE[$k]:-0}"
+        local fam_ext="$default_ext"
+        local conv="${FAMILY_COMP[$k]:-}"
+        if [[ -n "$conv" && "$conv" != "__MIXED__" ]]; then
+            fam_ext="$conv"
+        fi
+        local toolname
+        resolve_compressor "$fam_ext"
+        toolname="${RESOLVED_CMD[0]:-none}"
+        local conv_disp
+        if [[ "$conv" == "__MIXED__" ]]; then
+            conv_disp="mixed→$(ext_label "$default_ext")"
+        else
+            conv_disp="$(ext_label "$fam_ext") (${toolname})"
+        fi
+        local rel="${k#"$LOG_DIR"/}"
+        printf '  %-34s %-16s %7s %10s\n' "$(trunc "$rel" 34)" "$conv_disp" "$members" "$done_n"
+    done
+
+    # --- Compressed files ---------------------------------------------------
+    if [[ "${#RPT_COMPRESSED[@]}" -gt 0 ]]; then
+        printf '\n%s\n' "$thin"
+        printf '  %s\n' "$( [[ $DRY_RUN -eq 1 ]] && echo 'WOULD COMPRESS' || echo 'COMPRESSED' )"
+        printf '%s\n' "$thin"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            printf '  %-40s %-8s %10s\n' "File" "Tool" "Size"
+        else
+            printf '  %-40s %-8s %10s %10s %7s\n' "File" "Tool" "Before" "After" "Saved"
+        fi
+        local entry file tool orig comp
+        for entry in "${RPT_COMPRESSED[@]}"; do
+            IFS="$SEP" read -r file tool orig comp <<< "$entry"
+            local rel="${file#"$LOG_DIR"/}"
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                printf '  %-40s %-8s %10s\n' "$(trunc "$rel" 40)" "$tool" "$(human_bytes "$orig")"
+            else
+                printf '  %-40s %-8s %10s %10s %6s%%\n' \
+                    "$(trunc "$rel" 40)" "$tool" \
+                    "$(human_bytes "$orig")" "$(human_bytes "$comp")" "$(pct_saved "$orig" "$comp")"
+            fi
+        done
+    fi
+
+    # --- Skipped ------------------------------------------------------------
+    if [[ "${#RPT_SKIP_REASONS[@]}" -gt 0 ]]; then
+        printf '\n%s\n' "$thin"
+        printf '  SKIPPED (by reason)\n'
+        printf '%s\n' "$thin"
+        local reason
+        for reason in "${!RPT_SKIP_REASONS[@]}"; do
+            printf '  %-44s %4s\n' "$reason" "${RPT_SKIP_REASONS[$reason]}"
+        done
+        if [[ "$VERBOSE" -eq 1 && "${#RPT_SKIP_FILES[@]}" -gt 0 ]]; then
+            printf '\n  Detail:\n'
+            local sentry sfile sreason
+            for sentry in "${RPT_SKIP_FILES[@]}"; do
+                IFS="$SEP" read -r sfile sreason <<< "$sentry"
+                printf '    %-50s  %s\n' "$(trunc "${sfile#"$LOG_DIR"/}" 50)" "$sreason"
+            done
+        fi
+    fi
+
+    # --- Failed -------------------------------------------------------------
+    if [[ "${#RPT_FAILED[@]}" -gt 0 ]]; then
+        printf '\n%s\n' "$thin"
+        printf '  FAILED\n'
+        printf '%s\n' "$thin"
+        local ffile
+        for ffile in "${RPT_FAILED[@]}"; do
+            printf '  %s\n' "$ffile"
+        done
+    fi
+
+    # --- Totals -------------------------------------------------------------
+    printf '\n%s\n' "$thin"
+    printf '  TOTALS\n'
+    printf '%s\n' "$thin"
+    printf '  %-22s %d\n' "Files compressed" "${#RPT_COMPRESSED[@]}"
+    printf '  %-22s %d\n' "Files skipped"    "${#RPT_SKIP_FILES[@]}"
+    printf '  %-22s %d\n' "Files failed"     "${#RPT_FAILED[@]}"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf '  %-22s %s\n' "Original size"  "$(human_bytes "$TOTAL_ORIG")"
+        printf '  %-22s %s\n' "(projected)"    "savings shown only on a real run"
+    else
+        printf '  %-22s %s\n' "Original size"   "$(human_bytes "$TOTAL_ORIG")"
+        printf '  %-22s %s\n' "Compressed size" "$(human_bytes "$TOTAL_COMP")"
+        local saved=$(( TOTAL_ORIG - TOTAL_COMP ))
+        printf '  %-22s %s (%s%%)\n' "Space reclaimed" \
+            "$(human_bytes "$saved")" "$(pct_saved "$TOTAL_ORIG" "$TOTAL_COMP")"
+    fi
+    printf '  %-22s %ss\n' "Elapsed" "$elapsed"
+    printf '%s\n' "$rule"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+declare -A FAMILY_COMP
+declare -A FAMILY_COUNT
+
+main() {
+    parse_args "$@"
+    validate_args
+    check_deps
+
+    RUN_START_EPOCH=$(date +%s)
+
+    local default_ext
+    default_ext="$(ext_for_compressor "$DEFAULT_COMPRESSOR")"
+
+    local -a find_depth_args=()
+    [[ "$RECURSE" -eq 0 ]] && find_depth_args=( -maxdepth 1 )
+
+    local gz_tool bz2_tool xz_tool
+    resolve_compressor gz;  gz_tool="${RESOLVED_CMD[0]:-none}"
+    resolve_compressor bz2; bz2_tool="${RESOLVED_CMD[0]:-none}"
+    resolve_compressor xz;  xz_tool="${RESOLVED_CMD[0]:-none}"
+
+    log_info "Log directory : ${LOG_DIR}"
+    log_info "Recurse       : $( [[ $RECURSE -eq 1 ]] && echo yes || echo no )"
+    log_info "Default comp  : ${DEFAULT_COMPRESSOR} (.${default_ext})"
+    log_info "Compressors   : gz=${gz_tool}  bz2=${bz2_tool}  xz=${xz_tool}"
+    log_info "Threads       : $( [[ $THREADS -eq 0 ]] && echo 'auto (all cores)' || echo "$THREADS" )"
+    log_info "Dry run       : $( [[ $DRY_RUN -eq 1 ]] && echo yes || echo no )"
+    printf "\n"
+
+    local -a files=()
+    local f
+    while IFS= read -r -d '' f; do
+        files+=("$f")
+    done < <(find "$LOG_DIR" "${find_depth_args[@]}" -type f -print0)
+
+    if [[ "${#files[@]}" -eq 0 ]]; then
+        log_info "No regular files found under ${LOG_DIR}."
+        print_report "$default_ext"
+        exit 0
+    fi
+
+    declare -A OPEN_FILES
+    if [[ "$HAVE_LSOF" -eq 1 ]]; then
+        local oline
+        while IFS= read -r oline; do
+            [[ "$oline" == n/* ]] && OPEN_FILES["${oline#n}"]=1
+        done < <(lsof -Fn -- "${files[@]}" 2>/dev/null || true)
+    fi
+
+    # --- Pass 1: learn family convention/size; cache parsed fields ----------
+    local -a F_KEY F_ROT F_COMP
+    local i d b key
+    for i in "${!files[@]}"; do
+        f="${files[i]}"
+        d="${f%/*}"
+        b="${f##*/}"
+        parse_logname "$b"
+        key="${d}/${PARSED_KEY}"
+        F_KEY[i]="$key"; F_ROT[i]="$PARSED_ROT"; F_COMP[i]="$PARSED_COMP"
+        FAMILY_COUNT["$key"]=$(( ${FAMILY_COUNT["$key"]:-0} + 1 ))
+        if [[ -n "$PARSED_COMP" ]]; then
+            local prev="${FAMILY_COMP[$key]:-}"
+            if [[ -z "$prev" ]]; then
+                FAMILY_COMP["$key"]="$PARSED_COMP"
+            elif [[ "$prev" != "$PARSED_COMP" ]]; then
+                FAMILY_COMP["$key"]="__MIXED__"
+            fi
+        fi
+    done
+
+    # --- Pass 2: compress ---------------------------------------------------
+    declare -A _WARNED_MIXED
+    for i in "${!files[@]}"; do
+        f="${files[i]}"
+        key="${F_KEY[i]}"
+
+        if [[ -n "${F_COMP[i]}" ]]; then
+            log_verbose "Skip (already compressed): ${f}"
+            record_skip "$f" "already compressed"; continue
+        fi
+        if [[ ! -s "$f" ]]; then
+            log_verbose "Skip (empty): ${f}"
+            record_skip "$f" "empty"; continue
+        fi
+        if [[ "$INCLUDE_ACTIVE" -eq 0 && -z "${F_ROT[i]}" \
+              && "${FAMILY_COUNT[$key]:-1}" -gt 1 ]]; then
+            log_verbose "Skip (active log of rotated family): ${f}"
+            record_skip "$f" "active log of rotated family"; continue
+        fi
+        if [[ -n "${OPEN_FILES[$f]:-}" ]]; then
+            log_warn "Skip (file open): ${f}"
+            record_skip "$f" "file open"; continue
+        fi
+
+        local fam="${FAMILY_COMP[$key]:-}"
+        local use_ext
+        if [[ -z "$fam" ]]; then
+            use_ext="$default_ext"
+        elif [[ "$fam" == "__MIXED__" ]]; then
+            if [[ -z "${_WARNED_MIXED[$key]:-}" ]]; then
+                log_warn "Family '${key}' has mixed compression formats — using default ${DEFAULT_COMPRESSOR}."
+                _WARNED_MIXED["$key"]=1
+            fi
+            use_ext="$default_ext"
+        else
+            use_ext="$fam"
+        fi
+
+        if ! can_produce "$use_ext"; then
+            log_warn "Skip (cannot produce .${use_ext} for family '${key}'): ${f}"
+            record_skip "$f" "cannot produce .${use_ext}"; continue
+        fi
+
+        local target="${f}.${use_ext}"
+        if [[ -e "$target" ]]; then
+            log_warn "Skip (target exists): ${target}"
+            record_skip "$f" "target exists"; continue
+        fi
+
+        if do_compress "$f" "$use_ext"; then
+            RPT_FAM_DONE["$key"]=$(( ${RPT_FAM_DONE["$key"]:-0} + 1 ))
+        fi
+    done
+
+    print_report "$default_ext"
+
+    if [[ "${#RPT_FAILED[@]}" -gt 0 ]]; then
+        exit 1
+    fi
+    exit 0
+}
+
+main "$@"
