@@ -20,13 +20,15 @@ Blindly running `bzip2` over everything would produce a `messages.1.bz2` sitting
 - `bash` 4.2 or newer (RHEL 7/8/9 all qualify)
 - `find` and GNU coreutils (`stat`, `sort`, `rm`, `date`, `chmod`, `chown`, `touch`)
 - At least one compressor for the formats you use: `gzip`/`pigz`, `bzip2`/`lbzip2`, `xz`, and/or `7z`/`7za`/`7zr`
-- `lsof` is optional; if present, open files are skipped, otherwise that check is skipped with a warning
+- `lsof` and `xargs` are optional; if both are present, files currently held open by another process are skipped. If either is missing, that check is skipped with a warning (everything else still runs). `xargs` ships with findutils, so it is present wherever `find` is.
 
 On RHEL the parallel and 7z tools come from EPEL:
 
 ```
-sudo dnf install pigz lbzip2 p7zip    # xz threading is built in (xz >= 5.2)
+sudo dnf install pigz lbzip2 p7zip lsof    # xz threading is built in (xz >= 5.2)
 ```
+
+(`lsof` enables the open-file safety check; it is usually already installed.)
 
 ## Installation
 
@@ -63,7 +65,7 @@ A file is **skipped** when it is:
 
 - already compressed (`.gz .bz2 .xz .7z .zst .lz4 .lzo .Z .zip .zz`)
 - empty
-- currently open by another process (detected with a single batched `lsof` call)
+- currently open by another process (detected via `lsof`; candidate paths are passed through `xargs` so the check scales to very large trees, and the path matching is NUL-delimited so spaces in names are handled correctly)
 - the active, rotation-less member of a family that has other members (i.e. the live log) — override with `--include-active`
 - part of a family whose format this host cannot produce (e.g. a `.zst` family with no `zstd` installed), in which case it is left alone rather than mixed
 - already accompanied by an existing target file (no clobbering)
@@ -186,6 +188,7 @@ The script hardens `PATH` internally, so it behaves consistently under cron. The
 - An existing target (e.g. `messages.1.gz` already present) causes the source to be skipped rather than overwritten.
 - A family with two different existing compression formats is reported as mixed and compressed with the default, with a one-time warning.
 - Run as `root` (or a user with read/write access to the log directory) since `/var/log` files are typically root-owned. Owner preservation for 7z archives requires the privilege to `chown`; without it, the archive keeps the running user's ownership and a non-fatal best-effort attempt is made.
+- The open-file check (when `lsof` and `xargs` are available) prevents compressing a log a process is still writing to. As an extra precaution, a file whose name contains a newline is skipped while this check is active, because `lsof` escapes such names in its output and the script cannot reliably confirm the file is closed. Normal log names are unaffected; this only concerns pathological filenames.
 
 ## Examples
 
