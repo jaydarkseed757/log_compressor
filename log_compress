@@ -265,7 +265,11 @@ check_deps() {
         || die "Cannot produce .${default_ext} — no tool for default compressor ${DEFAULT_COMPRESSOR}."
 
     if command -v lsof &>/dev/null; then
-        HAVE_LSOF=1
+        if command -v xargs &>/dev/null; then
+            HAVE_LSOF=1
+        else
+            log_warn "xargs not found — open-file check will be skipped."
+        fi
     else
         log_warn "lsof not found — open-file check will be skipped."
     fi
@@ -317,6 +321,16 @@ pct_saved() {
     local orig="$1" comp="$2"
     (( orig <= 0 )) && { printf '0'; return; }
     printf '%d' $(( (orig - comp) * 100 / orig ))
+}
+
+# saved_display <orig> <comp>  — per-file savings cell for the report.
+# Shows "grew" when compression overhead made the file larger (common for
+# tiny inputs), instead of a misleading negative percentage.
+saved_display() {
+    local orig="$1" comp="$2"
+    if (( orig <= 0 )); then printf 'n/a'; return; fi
+    if (( comp >= orig )); then printf 'grew'; return; fi
+    printf '%d%%' $(( (orig - comp) * 100 / orig ))
 }
 
 # trunc <string> <maxlen>  — left-truncate with leading ellipsis
@@ -379,6 +393,15 @@ do_compress() {
         local dir="${filepath%/*}"
         [[ "$dir" == "$filepath" ]] && dir="."
         local base="${filepath##*/}"
+        # 7z APPENDS to an existing archive rather than refusing (unlike the
+        # stream tools). Re-check immediately before archiving to close the
+        # gap between the caller's pre-check and now, so a target that appeared
+        # in between can't be silently merged into.
+        if [[ -e "$target" ]]; then
+            log_warn "Skip (target appeared before archiving): ${target}"
+            record_skip "$filepath" "target exists"
+            return 1
+        fi
         if ( cd "$dir" && "${RESOLVED_CMD[@]}" "${base}.${ext}" "$base" >/dev/null 2>&1 ); then
             # 7z gives the archive default perms — copy the original's metadata
             chmod --reference="$filepath" "$target" 2>/dev/null || true
@@ -490,9 +513,9 @@ print_report() {
             if [[ "$DRY_RUN" -eq 1 ]]; then
                 printf '  %-40s %-8s %10s\n' "$(trunc "$rel" 40)" "$tool" "$(human_bytes "$orig")"
             else
-                printf '  %-40s %-8s %10s %10s %6s%%\n' \
+                printf '  %-40s %-8s %10s %10s %7s\n' \
                     "$(trunc "$rel" 40)" "$tool" \
-                    "$(human_bytes "$orig")" "$(human_bytes "$comp")" "$(pct_saved "$orig" "$comp")"
+                    "$(human_bytes "$orig")" "$(human_bytes "$comp")" "$(saved_display "$orig" "$comp")"
             fi
         done
     fi
@@ -541,8 +564,13 @@ print_report() {
         printf '  %-22s %s\n' "Original size"   "$(human_bytes "$TOTAL_ORIG")"
         printf '  %-22s %s\n' "Compressed size" "$(human_bytes "$TOTAL_COMP")"
         local saved=$(( TOTAL_ORIG - TOTAL_COMP ))
-        printf '  %-22s %s (%s%%)\n' "Space reclaimed" \
-            "$(human_bytes "$saved")" "$(pct_saved "$TOTAL_ORIG" "$TOTAL_COMP")"
+        if (( saved < 0 )); then
+            printf '  %-22s %s larger (compression overhead exceeded savings)\n' \
+                "Net change" "$(human_bytes $(( -saved )))"
+        else
+            printf '  %-22s %s (%s%%)\n' "Space reclaimed" \
+                "$(human_bytes "$saved")" "$(pct_saved "$TOTAL_ORIG" "$TOTAL_COMP")"
+        fi
     fi
     printf '  %-22s %ss\n' "Elapsed" "$elapsed"
     printf '%s\n' "$rule"
@@ -595,10 +623,20 @@ main() {
 
     declare -A OPEN_FILES
     if [[ "$HAVE_LSOF" -eq 1 ]]; then
-        local oline
-        while IFS= read -r oline; do
-            [[ "$oline" == n/* ]] && OPEN_FILES["${oline#n}"]=1
-        done < <(lsof -Fn -- "${files[@]}" 2>/dev/null || true)
+        # Feed candidate paths to lsof through xargs so the argument list is
+        # automatically split to stay under ARG_MAX on very large trees.
+        # NUL is used end to end: -0 for xargs input and -F0n for lsof output,
+        # so filenames containing spaces or even newlines are handled correctly.
+        # (-r/--no-run-if-empty guards against lsof listing every open file if
+        # the input were ever empty.)
+        local field
+        while IFS= read -r -d '' field; do
+            # lsof prefixes each field set with a newline even in NUL mode;
+            # strip a single leading newline before testing the field id.
+            field="${field#$'\n'}"
+            [[ "$field" == n* ]] && OPEN_FILES["${field:1}"]=1
+        done < <(printf '%s\0' "${files[@]}" \
+                    | xargs -0 -r lsof -F0n 2>/dev/null || true)
     fi
 
     # --- Pass 1: learn family convention/size; cache parsed fields ----------
@@ -640,6 +678,14 @@ main() {
               && "${FAMILY_COUNT[$key]:-1}" -gt 1 ]]; then
             log_verbose "Skip (active log of rotated family): ${f}"
             record_skip "$f" "active log of rotated family"; continue
+        fi
+        # lsof escapes control characters (e.g. newlines) in its output, so a
+        # path containing a newline can't be reliably matched against the open
+        # set. Rather than risk compressing a live log, skip it conservatively
+        # when the open-file check is in effect.
+        if [[ "$HAVE_LSOF" -eq 1 && "$f" == *$'\n'* ]]; then
+            log_warn "Skip (newline in name; cannot verify open state): ${f}"
+            record_skip "$f" "newline in name (unverifiable)"; continue
         fi
         if [[ -n "${OPEN_FILES[$f]:-}" ]]; then
             log_warn "Skip (file open): ${f}"
