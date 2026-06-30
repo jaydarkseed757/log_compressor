@@ -60,7 +60,7 @@ VERBOSE=0
 RECURSE=0
 INCLUDE_ACTIVE=0
 
-readonly -a COMPRESSED_EXTENSIONS=(gz bz2 xz zst lz4 lzo Z zip zz)
+readonly -a COMPRESSED_EXTENSIONS=(gz bz2 xz 7z zst lz4 lzo Z zip zz)
 
 # ---------------------------------------------------------------------------
 # Runtime report state
@@ -98,7 +98,7 @@ Usage:
 Options:
   -d DIR            Directory to process          (default: ${LOG_DIR})
   -c COMPRESSOR     Default compressor for families with no compressed
-                    members yet: bzip2 | gzip | xz (default: ${DEFAULT_COMPRESSOR})
+                    members yet: bzip2 | gzip | xz | 7z (default: ${DEFAULT_COMPRESSOR})
   -T, --threads N   Threads for parallel compressors, 0 = auto/all cores
                     (default: ${THREADS})
   -r                Recurse into subdirectories
@@ -155,8 +155,8 @@ validate_args() {
     [[ -x "$LOG_DIR" ]] || die "Directory not executable (cannot list): ${LOG_DIR}"
 
     case "$DEFAULT_COMPRESSOR" in
-        bzip2|gzip|xz) ;;
-        *) die "-c must be one of: bzip2, gzip, xz (got: ${DEFAULT_COMPRESSOR})" ;;
+        bzip2|gzip|xz|7z) ;;
+        *) die "-c must be one of: bzip2, gzip, xz, 7z (got: ${DEFAULT_COMPRESSOR})" ;;
     esac
 
     [[ "$THREADS" =~ ^[0-9]+$ ]] || die "-T/--threads must be a non-negative integer (got: ${THREADS})"
@@ -170,6 +170,7 @@ ext_for_compressor() {
         gzip)  printf 'gz'  ;;
         bzip2) printf 'bz2' ;;
         xz)    printf 'xz'  ;;
+        7z)    printf '7z'  ;;
         *)     printf ''    ;;
     esac
 }
@@ -180,7 +181,19 @@ ext_label() {
         gz)  printf 'gzip'  ;;
         bz2) printf 'bzip2' ;;
         xz)  printf 'xz'    ;;
+        7z)  printf '7z'    ;;
         *)   printf '%s' "$1" ;;
+    esac
+}
+
+# compressor_kind <ext> -> "archive" for 7z, "stream" for the rest.
+# Stream tools compress in place (preserving mode/owner/mtime). 7z is an
+# archiver: it creates a separate .7z container, so it needs different
+# handling and explicit metadata preservation.
+compressor_kind() {
+    case "$1" in
+        7z) printf 'archive' ;;
+        *)  printf 'stream'  ;;
     esac
 }
 
@@ -211,6 +224,21 @@ resolve_compressor() {
                     RESOLVED_CMD=(xz -9 -T0)
                 else
                     RESOLVED_CMD=(xz -9 -T "$THREADS")
+                fi
+            fi
+            ;;
+        7z)
+            local sevenzip="" b
+            for b in 7z 7zz 7za 7zr; do
+                if command -v "$b" &>/dev/null; then sevenzip="$b"; break; fi
+            done
+            if [[ -n "$sevenzip" ]]; then
+                # a=add, -mx=9 max compression, -bd no progress, -y assume yes
+                RESOLVED_CMD=("$sevenzip" a -mx=9 -bd -y)
+                if [[ "$THREADS" -eq 0 ]]; then
+                    RESOLVED_CMD+=(-mmt=on)
+                else
+                    RESOLVED_CMD+=(-mmt="$THREADS")
                 fi
             fi
             ;;
@@ -310,8 +338,10 @@ record_skip() {
 
 # ---------------------------------------------------------------------------
 # do_compress <filepath> <ext>
-# In-place compression preserves mode/owner/mtime. Records report data.
-# Returns 0 ok, 1 fail.
+# Stream tools (gz/bz2/xz) compress in place, preserving mode/owner/mtime.
+# Archive tools (7z) create a separate container, so metadata is copied onto
+# the archive explicitly and the original is removed only after success.
+# Records report data. Returns 0 ok, 1 fail.
 # ---------------------------------------------------------------------------
 do_compress() {
     local filepath="$1" ext="$2"
@@ -319,6 +349,8 @@ do_compress() {
 
     resolve_compressor "$ext"
     local tool="${RESOLVED_CMD[0]}"
+    local kind
+    kind="$(compressor_kind "$ext")"
 
     local orig=0
     orig=$(stat -c '%s' "$filepath" 2>/dev/null || echo 0)
@@ -329,15 +361,43 @@ do_compress() {
         if [[ "$VERBOSE" -eq 1 ]]; then
             local cmd_str
             cmd_str="$(IFS=' '; printf '%s' "${RESOLVED_CMD[*]}")"
-            log_info "[DRY-RUN] ${cmd_str} -- ${filepath}   (→ ${target})"
+            if [[ "$kind" == "archive" ]]; then
+                log_info "[DRY-RUN] ${cmd_str} ${target##*/} ${filepath##*/}   (in ${filepath%/*})"
+            else
+                log_info "[DRY-RUN] ${cmd_str} -- ${filepath}   (→ ${target})"
+            fi
         else
             log_info "[DRY-RUN] Would compress with ${tool}: ${filepath} → ${target}"
         fi
         return 0
     fi
 
-    if "${RESOLVED_CMD[@]}" -- "$filepath" 2>/dev/null; then
-        [[ -e "$filepath" && -e "$target" ]] && rm -f "$filepath"
+    local ok=0
+    if [[ "$kind" == "archive" ]]; then
+        # Archive from within the file's directory so the stored path is just
+        # the basename (so messages.1.7z extracts to messages.1, not a tree).
+        local dir="${filepath%/*}"
+        [[ "$dir" == "$filepath" ]] && dir="."
+        local base="${filepath##*/}"
+        if ( cd "$dir" && "${RESOLVED_CMD[@]}" "${base}.${ext}" "$base" >/dev/null 2>&1 ); then
+            # 7z gives the archive default perms — copy the original's metadata
+            chmod --reference="$filepath" "$target" 2>/dev/null || true
+            chown --reference="$filepath" "$target" 2>/dev/null || true
+            touch -r "$filepath" "$target" 2>/dev/null || true
+            rm -f "$filepath"
+            ok=1
+        else
+            # Roll back any partial archive; original is untouched (no -sdel)
+            [[ -e "$target" ]] && rm -f "$target"
+        fi
+    else
+        if "${RESOLVED_CMD[@]}" -- "$filepath" 2>/dev/null; then
+            [[ -e "$filepath" && -e "$target" ]] && rm -f "$filepath"
+            ok=1
+        fi
+    fi
+
+    if [[ "$ok" -eq 1 ]]; then
         local comp=0
         comp=$(stat -c '%s' "$target" 2>/dev/null || echo 0)
         RPT_COMPRESSED+=("${filepath}${SEP}${tool}${SEP}${orig}${SEP}${comp}")
@@ -507,15 +567,16 @@ main() {
     local -a find_depth_args=()
     [[ "$RECURSE" -eq 0 ]] && find_depth_args=( -maxdepth 1 )
 
-    local gz_tool bz2_tool xz_tool
+    local gz_tool bz2_tool xz_tool sevenz_tool
     resolve_compressor gz;  gz_tool="${RESOLVED_CMD[0]:-none}"
     resolve_compressor bz2; bz2_tool="${RESOLVED_CMD[0]:-none}"
     resolve_compressor xz;  xz_tool="${RESOLVED_CMD[0]:-none}"
+    resolve_compressor 7z;  sevenz_tool="${RESOLVED_CMD[0]:-none}"
 
     log_info "Log directory : ${LOG_DIR}"
     log_info "Recurse       : $( [[ $RECURSE -eq 1 ]] && echo yes || echo no )"
     log_info "Default comp  : ${DEFAULT_COMPRESSOR} (.${default_ext})"
-    log_info "Compressors   : gz=${gz_tool}  bz2=${bz2_tool}  xz=${xz_tool}"
+    log_info "Compressors   : gz=${gz_tool}  bz2=${bz2_tool}  xz=${xz_tool}  7z=${sevenz_tool}"
     log_info "Threads       : $( [[ $THREADS -eq 0 ]] && echo 'auto (all cores)' || echo "$THREADS" )"
     log_info "Dry run       : $( [[ $DRY_RUN -eq 1 ]] && echo yes || echo no )"
     printf "\n"
