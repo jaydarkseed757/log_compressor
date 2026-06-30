@@ -1,6 +1,6 @@
 # compress_logs.sh
 
-Compress uncompressed log files while keeping each log family consistent with the compression format it already uses. A `gzip` family stays `gzip`, a `bzip2` family stays `bzip2`, and brand-new families fall back to a configurable default. Parallel compressors (`pigz`, `lbzip2`, threaded `xz`) are used automatically when installed, and every run ends with a detailed report.
+Compress uncompressed log files while keeping each log family consistent with the compression format it already uses. A `gzip` family stays `gzip`, a `bzip2` family stays `bzip2`, a `7z` family stays `7z`, and brand-new families fall back to a configurable default. Parallel compressors (`pigz`, `lbzip2`, threaded `xz`) are used automatically when installed, and every run ends with a detailed report.
 
 ## Why
 
@@ -18,14 +18,14 @@ Blindly running `bzip2` over everything would produce a `messages.1.bz2` sitting
 ## Requirements
 
 - `bash` 4.2 or newer (RHEL 7/8/9 all qualify)
-- `find` and GNU coreutils (`stat`, `sort`, `rm`, `date`)
-- At least one compressor for the formats you use: `gzip`/`pigz`, `bzip2`/`lbzip2`, `xz`
+- `find` and GNU coreutils (`stat`, `sort`, `rm`, `date`, `chmod`, `chown`, `touch`)
+- At least one compressor for the formats you use: `gzip`/`pigz`, `bzip2`/`lbzip2`, `xz`, and/or `7z`/`7za`/`7zr`
 - `lsof` is optional; if present, open files are skipped, otherwise that check is skipped with a warning
 
-On RHEL the parallel tools come from EPEL:
+On RHEL the parallel and 7z tools come from EPEL:
 
 ```
-sudo dnf install pigz lbzip2     # xz threading is built in (xz >= 5.2)
+sudo dnf install pigz lbzip2 p7zip    # xz threading is built in (xz >= 5.2)
 ```
 
 ## Installation
@@ -57,11 +57,11 @@ The script runs in two passes over the target directory.
 
 **Pass 1 — learn each family.** Every filename is split into a family key by stripping the rotation number and any compression extension. `messages`, `messages.1`, `messages.2`, and `messages.3.gz` all reduce to the family `messages`. The family key is qualified by directory, so `messages` under `/var/log` and `messages` under `/var/log/app/` are treated as separate families. For each family, the already-compressed members determine the convention (the format of `messages.3.gz` makes `messages` a gzip family).
 
-**Pass 2 — compress.** Each eligible uncompressed file is compressed with its family's compressor — using the parallel variant if available — preserving the original file's mode, owner, and modification time.
+**Pass 2 — compress.** Each eligible uncompressed file is compressed with its family's compressor — using the parallel variant if available — preserving the original file's mode, owner, and modification time. (For 7z families, see [7z support](#7z-support) below, since 7z is an archiver rather than an in-place stream compressor.)
 
 A file is **skipped** when it is:
 
-- already compressed (`.gz .bz2 .xz .zst .lz4 .lzo .Z .zip .zz`)
+- already compressed (`.gz .bz2 .xz .7z .zst .lz4 .lzo .Z .zip .zz`)
 - empty
 - currently open by another process (detected with a single batched `lsof` call)
 - the active, rotation-less member of a family that has other members (i.e. the live log) — override with `--include-active`
@@ -77,21 +77,35 @@ Families with no compressed members yet use the default compressor (`-c`, defaul
 | gzip   | `pigz`               | `gzip`   |
 | bzip2  | `lbzip2`             | `bzip2`  |
 | xz     | `xz -T` (threaded)   | —        |
+| 7z     | `7z` / `7za` / `7zr` (multithreaded by default) | — |
 
 The startup banner reports which tools were actually selected, for example:
 
 ```
-[INFO]  Compressors   : gz=pigz  bz2=lbzip2  xz=xz
+[INFO]  Compressors   : gz=pigz  bz2=lbzip2  xz=xz  7z=7z
 ```
 
-Thread count is controlled with `-T/--threads`; `0` (the default) lets each parallel tool use all available cores.
+A format whose tool is not installed shows as `none`; files in such a family are skipped rather than compressed into a different format.
+
+Thread count is controlled with `-T/--threads`; `0` (the default) lets each parallel tool use all available cores (for 7z this maps to `-mmt=on`).
+
+## 7z support
+
+7z is supported as both a recognized family convention and a `-c` default, but it works differently from the stream compressors and the script accounts for that:
+
+- **It is an archiver, not an in-place stream compressor.** `gzip`, `bzip2`, and `xz` each rewrite a single file in place. 7z instead creates a separate `.7z` container. The script runs 7z from inside the file's directory using the basename, so `messages.1` becomes an archive `messages.1.7z` whose single stored entry is `messages.1` — it extracts back to a plain file, not a nested directory tree.
+- **Metadata is preserved explicitly.** A 7z archive is created with default permissions, so the script copies the original file's mode, owner, and modification time onto the `.7z` (via `chmod`/`chown`/`touch --reference`) before removing the original. The stream compressors get this for free; 7z needs the extra step.
+- **The original is removed only after a verified-good archive.** The script does not use `7z -sdel`; it archives, confirms success, copies metadata, then deletes the source. If 7z fails, any partial archive is removed and the original is left untouched. 7z's non-fatal warning exit status is treated conservatively as a failure (roll back) rather than trusting a questionable archive.
+- The detected binary is whichever of `7z`, `7zz`, `7za`, or `7zr` is found first.
+
+Because 7z performs more work per file (extra metadata calls), the fast in-place path is still used for `gzip`/`bzip2`/`xz`; only 7z families incur the extra steps.
 
 ## Options
 
 | Option | Description |
 |--------|-------------|
 | `-d DIR` | Directory to process (default: `/var/log`) |
-| `-c COMPRESSOR` | Default compressor for families with no compressed members: `bzip2`, `gzip`, or `xz` (default: `bzip2`) |
+| `-c COMPRESSOR` | Default compressor for families with no compressed members: `bzip2`, `gzip`, `xz`, or `7z` (default: `bzip2`) |
 | `-T, --threads N` | Threads for parallel compressors; `0` = auto/all cores (default: `0`) |
 | `-r` | Recurse into subdirectories |
 | `--include-active` | Also compress active (rotation-less) logs that have siblings |
@@ -168,10 +182,10 @@ The script hardens `PATH` internally, so it behaves consistently under cron. The
 
 ## Notes and safety
 
-- Compression is done **in place** so the original file's permissions, owner, and timestamp are preserved — important for sensitive logs such as `secure` (often `0600 root`). This matches how `gzip` and `logrotate` behave.
+- Stream formats (`gzip`/`bzip2`/`xz`) compress **in place**, so the original file's permissions, owner, and timestamp are preserved automatically — important for sensitive logs such as `secure` (often `0600 root`). This matches how `gzip` and `logrotate` behave. The `7z` archiver preserves the same metadata, copied onto the archive explicitly (see [7z support](#7z-support)).
 - An existing target (e.g. `messages.1.gz` already present) causes the source to be skipped rather than overwritten.
 - A family with two different existing compression formats is reported as mixed and compressed with the default, with a one-time warning.
-- Run as `root` (or a user with read/write access to the log directory and read access to the `sa`-style files) since `/var/log` files are typically root-owned.
+- Run as `root` (or a user with read/write access to the log directory) since `/var/log` files are typically root-owned. Owner preservation for 7z archives requires the privilege to `chown`; without it, the archive keeps the running user's ownership and a non-fatal best-effort attempt is made.
 
 ## Examples
 
@@ -184,4 +198,7 @@ compress_logs.sh -d /opt/myapp/logs -r -c gzip
 
 # Single-threaded run (e.g. to limit load on a busy box)
 compress_logs.sh -r -T 1
+
+# Default brand-new families to 7z archives
+compress_logs.sh -d /opt/myapp/logs -r -c 7z
 ```
